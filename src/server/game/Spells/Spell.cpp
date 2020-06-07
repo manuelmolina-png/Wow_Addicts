@@ -3035,7 +3035,7 @@ void Spell::cancel()
     {
         case SPELL_STATE_PREPARING:
             CancelGlobalCooldown();
-            // no break
+            /* fallthrough */
         case SPELL_STATE_DELAYED:
             SendInterrupted(0);
             SendCastResult(SPELL_FAILED_INTERRUPTED);
@@ -4530,22 +4530,25 @@ void Spell::TakeCastItem()
     bool expendable = false;
     bool withoutCharges = false;
 
-    for (uint8 i = 0; i < proto->Effects.size() && i < 5; ++i)
+    for (ItemEffectEntry const* itemEffect : m_CastItem->GetEffects())
     {
+        if (itemEffect->LegacySlotIndex >= m_CastItem->m_itemData->SpellCharges.size())
+            continue;
+
         // item has limited charges
-        if (proto->Effects[i]->Charges)
+        if (itemEffect->Charges)
         {
-            if (proto->Effects[i]->Charges < 0)
+            if (itemEffect->Charges < 0)
                 expendable = true;
 
-            int32 charges = m_CastItem->GetSpellCharges(i);
+            int32 charges = m_CastItem->GetSpellCharges(itemEffect->LegacySlotIndex);
 
             // item has charges left
             if (charges)
             {
                 (charges > 0) ? --charges : ++charges;  // abs(charges) less at 1 after use
                 if (proto->GetMaxStackSize() == 1)
-                    m_CastItem->SetSpellCharges(i, charges);
+                    m_CastItem->SetSpellCharges(itemEffect->LegacySlotIndex, charges);
                 m_CastItem->SetState(ITEM_CHANGED, player);
             }
 
@@ -4695,10 +4698,8 @@ void Spell::TakeReagents()
     if (m_caster->GetTypeId() != TYPEID_PLAYER)
         return;
 
-    ItemTemplate const* castItemTemplate = m_CastItem ? m_CastItem->GetTemplate() : NULL;
-
     // do not take reagents for these item casts
-    if (castItemTemplate && castItemTemplate->GetFlags() & ITEM_FLAG_NO_REAGENT_COST)
+    if (m_CastItem && m_CastItem->GetTemplate()->GetFlags() & ITEM_FLAG_NO_REAGENT_COST)
         return;
 
     Player* p_caster = m_caster->ToPlayer();
@@ -4714,13 +4715,16 @@ void Spell::TakeReagents()
         uint32 itemcount = m_spellInfo->ReagentCount[x];
 
         // if CastItem is also spell reagent
-        if (castItemTemplate && castItemTemplate->GetId() == itemid)
+        if (m_CastItem && m_CastItem->GetEntry() == itemid)
         {
-            for (uint8 s = 0; s < castItemTemplate->Effects.size() && s < 5; ++s)
+            for (ItemEffectEntry const* itemEffect : m_CastItem->GetEffects())
             {
+                if (itemEffect->LegacySlotIndex >= m_CastItem->m_itemData->SpellCharges.size())
+                    continue;
+
                 // CastItem will be used up and does not count as reagent
-                int32 charges = m_CastItem->GetSpellCharges(s);
-                if (castItemTemplate->Effects[s]->Charges < 0 && abs(charges) < 2)
+                int32 charges = m_CastItem->GetSpellCharges(itemEffect->LegacySlotIndex);
+                if (itemEffect->Charges < 0 && abs(charges) < 2)
                 {
                     ++itemcount;
                     break;
@@ -4997,18 +5001,6 @@ SpellCastResult Spell::CheckCast(bool strict, uint32* param1 /*= nullptr*/, uint
 
     if (Unit* target = m_targets.GetUnitTarget())
     {
-        // do not allow to cast on hostile targets in sanctuary
-        if (!m_caster->IsFriendlyTo(target))
-        {
-            if (m_caster->IsInSanctuary() || target->IsInSanctuary())
-            {
-                // fix for duels
-                Player* player = m_caster->ToPlayer();
-                if (!player || !player->duel || target != player->duel->opponent)
-                    return SPELL_FAILED_NOTHING_TO_DISPEL;
-            }
-        }
-
         SpellCastResult castResult = m_spellInfo->CheckTarget(m_caster, target, m_caster->GetEntry() == WORLD_TRIGGER); // skip stealth checks for GO casts
         if (castResult != SPELL_CAST_OK)
             return castResult;
@@ -5181,9 +5173,6 @@ SpellCastResult Spell::CheckCast(bool strict, uint32* param1 /*= nullptr*/, uint
             }
             case SPELL_EFFECT_LEARN_SPELL:
             {
-                if (m_caster->GetTypeId() != TYPEID_PLAYER)
-                    return SPELL_FAILED_BAD_TARGETS;
-
                 if (effect->TargetA.GetTarget() != TARGET_UNIT_PET)
                     break;
 
@@ -5469,7 +5458,8 @@ SpellCastResult Spell::CheckCast(bool strict, uint32* param1 /*= nullptr*/, uint
                     case SUMMON_CATEGORY_PET:
                         if (!m_spellInfo->HasAttribute(SPELL_ATTR1_DISMISS_PET) && !m_caster->GetPetGUID().IsEmpty())
                             return SPELL_FAILED_ALREADY_HAVE_SUMMON;
-                    // intentional missing break, check both GetPetGUID() and GetCharmGUID for SUMMON_CATEGORY_PET
+                        /* fallthrough */
+                    // intentional, check both GetPetGUID() and GetCharmGUID for SUMMON_CATEGORY_PET
                     case SUMMON_CATEGORY_PUPPET:
                         if (!m_caster->GetCharmGUID().IsEmpty())
                             return SPELL_FAILED_ALREADY_HAVE_CHARM;
@@ -5573,28 +5563,6 @@ SpellCastResult Spell::CheckCast(bool strict, uint32* param1 /*= nullptr*/, uint
             {
                 if (!m_targets.GetUnitTarget() || m_targets.GetUnitTarget() == m_caster)
                     return SPELL_FAILED_BAD_TARGETS;
-
-                uint32 dispelMask = m_spellInfo->GetDispelMask(DispelType(effect->MiscValue));
-                bool hasStealableAura = false;
-                for (AuraApplication* visibleAura : m_targets.GetUnitTarget()->GetVisibleAuras())
-                {
-                    if (!visibleAura->IsPositive())
-                        continue;
-
-                    Aura const* aura = visibleAura->GetBase();
-                    if (!(aura->GetSpellInfo()->GetDispelMask() & dispelMask))
-                        continue;
-
-                    if (aura->IsPassive() || aura->GetSpellInfo()->HasAttribute(SPELL_ATTR4_NOT_STEALABLE))
-                        continue;
-
-                    hasStealableAura = true;
-                    break;
-                }
-
-                if (!hasStealableAura)
-                    return SPELL_FAILED_NOTHING_TO_STEAL;
-
                 break;
             }
             case SPELL_EFFECT_LEAP_BACK:
@@ -6322,9 +6290,9 @@ SpellCastResult Spell::CheckItems(uint32* param1 /*= nullptr*/, uint32* param2 /
         if (!proto)
             return SPELL_FAILED_ITEM_NOT_READY;
 
-        for (uint8 i = 0; i < proto->Effects.size() && i < 5; ++i)
-            if (proto->Effects[i]->Charges)
-                if (m_CastItem->GetSpellCharges(i) == 0)
+        for (ItemEffectEntry const* itemEffect : m_CastItem->GetEffects())
+            if (itemEffect->LegacySlotIndex < m_CastItem->m_itemData->SpellCharges.size() && itemEffect->Charges)
+                if (m_CastItem->GetSpellCharges(itemEffect->LegacySlotIndex) == 0)
                     return SPELL_FAILED_NO_CHARGES_REMAIN;
 
         // consumable cast item checks
@@ -6424,11 +6392,15 @@ SpellCastResult Spell::CheckItems(uint32* param1 /*= nullptr*/, uint32* param2 /
                     ItemTemplate const* proto = m_CastItem->GetTemplate();
                     if (!proto)
                         return SPELL_FAILED_ITEM_NOT_READY;
-                    for (uint8 s = 0; s < proto->Effects.size() && s < 5; ++s)
+
+                    for (ItemEffectEntry const* itemEffect : m_CastItem->GetEffects())
                     {
+                        if (itemEffect->LegacySlotIndex >= m_CastItem->m_itemData->SpellCharges.size())
+                            continue;
+
                         // CastItem will be used up and does not count as reagent
-                        int32 charges = m_CastItem->GetSpellCharges(s);
-                        if (proto->Effects[s]->Charges < 0 && abs(charges) < 2)
+                        int32 charges = m_CastItem->GetSpellCharges(itemEffect->LegacySlotIndex);
+                        if (itemEffect->Charges < 0 && abs(charges) < 2)
                         {
                             ++itemcount;
                             break;
@@ -6545,7 +6517,7 @@ SpellCastResult Spell::CheckItems(uint32* param1 /*= nullptr*/, uint32* param2 /
                         return SPELL_FAILED_DONT_REPORT;
                     }
                 }
-                // no break
+                /* fallthrough */
             case SPELL_EFFECT_ENCHANT_ITEM_PRISMATIC:
             {
                 Item* targetItem = m_targets.GetItemTarget();
@@ -6557,10 +6529,9 @@ SpellCastResult Spell::CheckItems(uint32* param1 /*= nullptr*/, uint32* param2 /
                     return SPELL_FAILED_LOWLEVEL;
 
                 bool isItemUsable = false;
-                ItemTemplate const* proto = targetItem->GetTemplate();
-                for (uint8 e = 0; e < proto->Effects.size(); ++e)
+                for (ItemEffectEntry const* itemEffect : targetItem->GetEffects())
                 {
-                    if (proto->Effects[e]->SpellID && proto->Effects[e]->TriggerType == ITEM_SPELLTRIGGER_ON_USE)
+                    if (itemEffect->SpellID && itemEffect->TriggerType == ITEM_SPELLTRIGGER_ON_USE)
                     {
                         isItemUsable = true;
                         break;
@@ -6754,11 +6725,11 @@ SpellCastResult Spell::CheckItems(uint32* param1 /*= nullptr*/, uint32* param2 /
                      return SPELL_FAILED_ITEM_AT_MAX_CHARGES;
 
                  if (Item* item = player->GetItemByEntry(itemId))
-                 {
-                     for (uint8 x = 0; x < proto->Effects.size() && x < 5; ++x)
-                         if (proto->Effects[x]->Charges != 0 && item->GetSpellCharges(x) == proto->Effects[x]->Charges)
+                     for (ItemEffectEntry const* itemEffect : item->GetEffects())
+                         if (itemEffect->LegacySlotIndex <= item->m_itemData->SpellCharges.size()
+                             && itemEffect->Charges != 0
+                             && item->GetSpellCharges(itemEffect->LegacySlotIndex) == itemEffect->Charges)
                              return SPELL_FAILED_ITEM_AT_MAX_CHARGES;
-                 }
                  break;
             }
             case SPELL_EFFECT_RESPEC_AZERITE_EMPOWERED_ITEM:
@@ -7899,7 +7870,7 @@ bool WorldObjectSpellTargetCheck::operator()(WorldObject* target)
             case TARGET_CHECK_RAID_CLASS:
                 if (_referer->getClass() != unitTarget->getClass())
                     return false;
-                // nobreak;
+                /* fallthrough */
             case TARGET_CHECK_RAID:
                 if (unitTarget->IsTotem())
                     return false;
